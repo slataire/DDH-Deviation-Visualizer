@@ -2,8 +2,10 @@ import numpy as np
 import matplotlib.pyplot as plt
 import streamlit as st
 
-# ----- Functions -----
+# ----------------- FUNCTIONS -----------------
+
 def generate_trajectory(collar, length, dip, azimuth, lift_per_100, drift_per_100, step=10):
+    """Generate a deviated drillhole path with lift and drift applied incrementally."""
     x, y, z = [collar[0]], [collar[1]], [collar[2]]
     n_steps = int(length / step)
     dip_curr = dip
@@ -22,6 +24,7 @@ def generate_trajectory(collar, length, dip, azimuth, lift_per_100, drift_per_10
     return np.array(x), np.array(y), np.array(z)
 
 def plane_normal(strike, dip):
+    """Compute plane normal from strike and dip."""
     dipdir = (strike + 90) % 360
     dip_rad = np.radians(dip)
     dipdir_rad = np.radians(dipdir)
@@ -31,13 +34,14 @@ def plane_normal(strike, dip):
     return np.array([nx, ny, nz])
 
 def find_pierce_point(x, y, z, n, p0):
+    """Find where a drillhole intersects a plane defined by normal n and point p0."""
     p0 = np.array(p0)
     for i in range(len(x)-1):
         r1 = np.array([x[i], y[i], z[i]])
         r2 = np.array([x[i+1], y[i+1], z[i+1]])
         d1 = np.dot(n, r1 - p0)
         d2 = np.dot(n, r2 - p0)
-        if d1 * d2 <= 0:
+        if d1 * d2 <= 0:  # sign change means we crossed the plane
             t = d1 / (d1 - d2)
             return r1 + t * (r2 - r1)
     return None
@@ -48,21 +52,25 @@ def limits_with_margin(data, frac=0.05):
     return lo - margin, hi + margin
 
 def project_to_plane(x, y, z, strike, dip, origin):
+    """Project points into a plane-aligned coordinate system (strike and dip axes)."""
     strike_rad = np.radians(strike)
     dip_rad = np.radians(dip)
     dipdir_rad = np.radians((strike + 90) % 360)
+
     u_strike = np.array([np.sin(strike_rad), np.cos(strike_rad), 0])
     u_dip = np.array([
         np.sin(dipdir_rad) * np.cos(dip_rad),
         np.cos(dipdir_rad) * np.cos(dip_rad),
         -np.sin(dip_rad)
     ])
+
     coords = np.vstack([x, y, z]).T - origin
     s = coords @ u_strike
     d = coords @ u_dip
     return s, d
 
 def project_to_section(x, y, z, azim, origin):
+    """Project points into a vertical section aligned with a given azimuth."""
     azim_rad = np.radians(azim)
     u_sec = np.array([np.sin(azim_rad), np.cos(azim_rad), 0])
     coords = np.vstack([x, y, z]).T - origin
@@ -70,35 +78,38 @@ def project_to_section(x, y, z, azim, origin):
     return sec_x
 
 def add_end_arrow(ax, x, y, color='black'):
+    """Draw a single arrow at the end of a line."""
     ax.quiver(x[-2], y[-2],
               x[-1]-x[-2], y[-1]-y[-2],
               angles='xy', scale_units='xy', scale=1,
               width=0.01, color=color)
 
-# ----- Streamlit UI -----
+# ----------------- STREAMLIT UI -----------------
+
 st.title("DDH Deviation Visualizer")
 
 st.sidebar.header("Input Parameters")
 
-surface_elev = st.sidebar.number_input("Surface Elevation (m)", value=260.0)
-length = st.sidebar.number_input("Drillhole Length (m)", value=600.0)
-target_depth = st.sidebar.number_input("Target Depth (MD, m)", value=400.0)
+surface_elev = st.sidebar.number_input("Surface Elevation (m)", value=260.0, step=0.1)
+length = st.sidebar.number_input("Drillhole Length (m)", value=600.0, step=0.1)
+target_depth = st.sidebar.number_input("Target Depth (MD, m)", value=400.0, step=0.1)
 
-strike = st.sidebar.number_input("Structure Strike (deg)", value=300.0)
-dip = st.sidebar.number_input("Structure Dip (deg, positive down)", value=70.0)
+strike = st.sidebar.number_input("Structure Strike (deg)", value=300.0, step=0.1)
+dip = st.sidebar.number_input("Structure Dip (deg, positive down)", value=70.0, step=0.1)
 
-# Flip sign of dip: user enters positive downward
-plan_dip = - st.sidebar.number_input("Planned Dip (deg, positive down)", value=70.0)
-plan_azim = st.sidebar.number_input("Planned Azimuth (deg)", value=0.0)
-plan_lift = st.sidebar.number_input("Planned Lift (deg/100m)", value=1.5)
-plan_drift = st.sidebar.number_input("Planned Drift (deg/100m)", value=1.0)
+# Flip sign for dip: user enters positive downward
+plan_dip = - st.sidebar.number_input("Planned Dip (deg, positive down)", value=70.0, step=0.1)
+plan_azim = st.sidebar.number_input("Planned Azimuth (deg)", value=0.0, step=0.1)
+plan_lift = st.sidebar.number_input("Planned Lift (deg/100m)", value=1.5, step=0.1)
+plan_drift = st.sidebar.number_input("Planned Drift (deg/100m)", value=1.0, step=0.1)
 
-act_dip = - st.sidebar.number_input("Actual Dip (deg, positive down)", value=70.0)
-act_azim = st.sidebar.number_input("Actual Azimuth (deg)", value=0.0)
-act_lift = st.sidebar.number_input("Actual Lift (deg/100m)", value=5.0)
-act_drift = st.sidebar.number_input("Actual Drift (deg/100m)", value=2.0)
+act_dip = - st.sidebar.number_input("Actual Dip (deg, positive down)", value=70.0, step=0.1)
+act_azim = st.sidebar.number_input("Actual Azimuth (deg)", value=0.0, step=0.1)
+act_lift = st.sidebar.number_input("Actual Lift (deg/100m)", value=5.0, step=0.1)
+act_drift = st.sidebar.number_input("Actual Drift (deg/100m)", value=2.0, step=0.1)
 
-# ----- Calculations -----
+# ----------------- CALCULATIONS -----------------
+
 collar = (0, 0, 0)
 x_plan, y_plan, z_plan = generate_trajectory(collar, length, plan_dip, plan_azim, plan_lift, plan_drift)
 x_act, y_act, z_act = generate_trajectory(collar, length, act_dip, act_azim, act_lift, act_drift)
@@ -130,10 +141,11 @@ sec_act_x = project_to_section(x_act, y_act, z_act, plan_azim, origin)
 sec_pp_plan_x = project_to_section([pp_plan[0]], [pp_plan[1]], [pp_plan[2]], plan_azim, origin)
 sec_pp_act_x = project_to_section([pp_act[0]], [pp_act[1]], [pp_act[2]], plan_azim, origin)
 
-# ----- Plotting -----
+# ----------------- PLOTTING -----------------
+
 fig, axs = plt.subplots(3, 1, figsize=(10, 18))
 
-# Long section (structure plane)
+# --- Long section (structure plane) ---
 axs[0].plot(ls_plan_s, ls_plan_d, label='Planned')
 axs[0].plot(ls_act_s, ls_act_d, '--', label='Actual')
 axs[0].plot(ls_pp_plan_s, ls_pp_plan_d, 'x', color='red', markersize=10)
@@ -153,7 +165,7 @@ axs[0].invert_yaxis()
 axs[0].legend()
 axs[0].set_title('Long Section (In Plane of Structure)')
 
-# Cross section (along drill azimuth)
+# --- Cross section (vertical along drill azimuth) ---
 axs[1].plot(sec_plan_x, elev_plan, label='Planned')
 axs[1].plot(sec_act_x, elev_act, '--', label='Actual')
 axs[1].plot(sec_pp_plan_x, elev_pp_plan, 'x', color='red', markersize=10)
@@ -163,7 +175,7 @@ axs[1].plot([sec_pp_plan_x[0], sec_pp_act_x[0]],
 add_end_arrow(axs[1], sec_plan_x, elev_plan, 'blue')
 add_end_arrow(axs[1], sec_act_x, elev_act, 'orange')
 
-# Plane line using structure dip
+# Target plane line
 dip_rad = np.radians(dip)
 xs = np.linspace(sec_pp_plan_x[0] - 200, sec_pp_plan_x[0] + 200, 20)
 zs = elev_pp_plan - (xs - sec_pp_plan_x[0]) * np.tan(dip_rad)
@@ -175,13 +187,12 @@ axs[1].invert_yaxis()
 axs[1].legend()
 axs[1].set_title('Cross Section (Along Drill Azimuth)')
 
-# Plan view
+# --- Plan view ---
 axs[2].plot(x_plan, y_plan, label='Planned')
 axs[2].plot(x_act, y_act, '--', label='Actual')
 axs[2].plot(pp_plan[0], pp_plan[1], 'x', color='red', markersize=10)
 axs[2].plot(pp_act[0], pp_act[1], 'x', color='purple', markersize=10)
-axs[2].plot([pp_plan[0], pp_act[0]],
-            [pp_plan[1], pp_act[1]], 'k--')
+axs[2].plot([pp_plan[0], pp_act[0]], [pp_plan[1], pp_act[1]], 'k--')
 add_end_arrow(axs[2], x_plan, y_plan, 'blue')
 add_end_arrow(axs[2], x_act, y_act, 'orange')
 
@@ -197,10 +208,11 @@ axs[2].set_ylabel('Y (m)')
 axs[2].legend()
 axs[2].set_title('Plan View')
 
-# Equal aspect ratio for all plots
+# Equal aspect ratio for all
 for ax in axs:
     ax.set_aspect('equal', adjustable='datalim')
     ax.grid(True)
 
 plt.tight_layout()
 st.pyplot(fig)
+
