@@ -76,7 +76,7 @@ def add_end_arrow(ax, x, y, color='black'):
               width=0.01, color=color)
 
 # ----- Streamlit UI -----
-st.title("3D Drillhole Visualization App")
+st.title("DDH Deviation Visualizer")
 
 st.sidebar.header("Input Parameters")
 
@@ -85,14 +85,15 @@ length = st.sidebar.number_input("Drillhole Length (m)", value=600.0)
 target_depth = st.sidebar.number_input("Target Depth (MD, m)", value=400.0)
 
 strike = st.sidebar.number_input("Structure Strike (deg)", value=300.0)
-dip = st.sidebar.number_input("Structure Dip (deg)", value=70.0)
+dip = st.sidebar.number_input("Structure Dip (deg, positive down)", value=70.0)
 
-plan_dip = st.sidebar.number_input("Planned Dip (deg)", value=-70.0)
+# Flip sign of dip: user enters positive downward
+plan_dip = - st.sidebar.number_input("Planned Dip (deg, positive down)", value=70.0)
 plan_azim = st.sidebar.number_input("Planned Azimuth (deg)", value=0.0)
 plan_lift = st.sidebar.number_input("Planned Lift (deg/100m)", value=1.5)
 plan_drift = st.sidebar.number_input("Planned Drift (deg/100m)", value=1.0)
 
-act_dip = st.sidebar.number_input("Actual Dip (deg)", value=-70.0)
+act_dip = - st.sidebar.number_input("Actual Dip (deg, positive down)", value=70.0)
 act_azim = st.sidebar.number_input("Actual Azimuth (deg)", value=0.0)
 act_lift = st.sidebar.number_input("Actual Lift (deg/100m)", value=5.0)
 act_drift = st.sidebar.number_input("Actual Drift (deg/100m)", value=2.0)
@@ -130,14 +131,15 @@ sec_pp_plan_x = project_to_section([pp_plan[0]], [pp_plan[1]], [pp_plan[2]], pla
 sec_pp_act_x = project_to_section([pp_act[0]], [pp_act[1]], [pp_act[2]], plan_azim, origin)
 
 # ----- Plotting -----
-fig, axs = plt.subplots(1, 3, figsize=(20, 7))
+fig, axs = plt.subplots(3, 1, figsize=(10, 18))
 
-# Long section
+# Long section (structure plane)
 axs[0].plot(ls_plan_s, ls_plan_d, label='Planned')
 axs[0].plot(ls_act_s, ls_act_d, '--', label='Actual')
 axs[0].plot(ls_pp_plan_s, ls_pp_plan_d, 'x', color='red', markersize=10)
 axs[0].plot(ls_pp_act_s, ls_pp_act_d, 'x', color='purple', markersize=10)
-axs[0].plot([ls_pp_plan_s[0], ls_pp_act_s[0]], [ls_pp_plan_d[0], ls_pp_act_d[0]], 'k--')
+axs[0].plot([ls_pp_plan_s[0], ls_pp_act_s[0]],
+            [ls_pp_plan_d[0], ls_pp_act_d[0]], 'k--')
 add_end_arrow(axs[0], ls_plan_s, ls_plan_d, 'blue')
 add_end_arrow(axs[0], ls_act_s, ls_act_d, 'orange')
 
@@ -149,17 +151,19 @@ axs[0].set_xlabel('Along Strike (m)')
 axs[0].set_ylabel('Down Dip (m)')
 axs[0].invert_yaxis()
 axs[0].legend()
-axs[0].set_title('Long Section')
+axs[0].set_title('Long Section (In Plane of Structure)')
 
-# Cross section
+# Cross section (along drill azimuth)
 axs[1].plot(sec_plan_x, elev_plan, label='Planned')
 axs[1].plot(sec_act_x, elev_act, '--', label='Actual')
 axs[1].plot(sec_pp_plan_x, elev_pp_plan, 'x', color='red', markersize=10)
 axs[1].plot(sec_pp_act_x, elev_pp_act, 'x', color='purple', markersize=10)
-axs[1].plot([sec_pp_plan_x[0], sec_pp_act_x[0]], [elev_pp_plan, elev_pp_act], 'k--')
+axs[1].plot([sec_pp_plan_x[0], sec_pp_act_x[0]],
+            [elev_pp_plan, elev_pp_act], 'k--')
 add_end_arrow(axs[1], sec_plan_x, elev_plan, 'blue')
 add_end_arrow(axs[1], sec_act_x, elev_act, 'orange')
 
+# Plane line using structure dip
 dip_rad = np.radians(dip)
 xs = np.linspace(sec_pp_plan_x[0] - 200, sec_pp_plan_x[0] + 200, 20)
 zs = elev_pp_plan - (xs - sec_pp_plan_x[0]) * np.tan(dip_rad)
@@ -169,14 +173,15 @@ axs[1].set_xlabel('Section Distance (m)')
 axs[1].set_ylabel('Elevation (m)')
 axs[1].invert_yaxis()
 axs[1].legend()
-axs[1].set_title('Cross Section')
+axs[1].set_title('Cross Section (Along Drill Azimuth)')
 
 # Plan view
 axs[2].plot(x_plan, y_plan, label='Planned')
 axs[2].plot(x_act, y_act, '--', label='Actual')
 axs[2].plot(pp_plan[0], pp_plan[1], 'x', color='red', markersize=10)
 axs[2].plot(pp_act[0], pp_act[1], 'x', color='purple', markersize=10)
-axs[2].plot([pp_plan[0], pp_act[0]], [pp_plan[1], pp_act[1]], 'k--')
+axs[2].plot([pp_plan[0], pp_act[0]],
+            [pp_plan[1], pp_act[1]], 'k--')
 add_end_arrow(axs[2], x_plan, y_plan, 'blue')
 add_end_arrow(axs[2], x_act, y_act, 'orange')
 
@@ -184,12 +189,18 @@ plane_extent = 300
 strike_rad = np.radians(strike)
 dx = np.sin(strike_rad) * plane_extent
 dy = np.cos(strike_rad) * plane_extent
-axs[2].plot([pp_plan[0]-dx, pp_plan[0]+dx], [pp_plan[1]-dy, pp_plan[1]+dy], 'g-', label='Target Plane')
+axs[2].plot([pp_plan[0]-dx, pp_plan[0]+dx],
+            [pp_plan[1]-dy, pp_plan[1]+dy], 'g-', label='Target Plane')
 
 axs[2].set_xlabel('X (m)')
 axs[2].set_ylabel('Y (m)')
 axs[2].legend()
 axs[2].set_title('Plan View')
+
+# Equal aspect ratio for all plots
+for ax in axs:
+    ax.set_aspect('equal', adjustable='datalim')
+    ax.grid(True)
 
 plt.tight_layout()
 st.pyplot(fig)
