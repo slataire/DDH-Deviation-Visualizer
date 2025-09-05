@@ -25,7 +25,8 @@ def min_curvature_path(stations):
     AZs = np.deg2rad([wrap_az(float(s["Azimuth"])) for s in stations])
     DIP = np.array([float(s["Angle"]) for s in stations], float)
 
-    INC = np.deg2rad(90.0 - np.abs(DIP))  # inclination-from-vertical
+    # Inclination from vertical for geometry. Sign handled separately for vertical component.
+    INC = np.deg2rad(90.0 - np.abs(DIP))
     SGN = np.where(DIP <= 0.0, -1.0, 1.0)  # negative dip means down
 
     X, Y, Z = [0.0], [0.0], [0.0]
@@ -61,7 +62,8 @@ def make_planned_stations(length_m, step_m, az0, dip0, lift_per100, drift_per100
         d = min(step_m, length_m - md)
         md += d
         az = wrap_az(az + drift_per100*(d/100.0))
-        dip = clamp(dip - lift_per100*(d/100.0), -90.0, 90.0)  # minus because positive lift increases downward magnitude
+        # minus because positive lift increases downward magnitude, so to apply user lift correctly we subtract
+        dip = clamp(dip - lift_per100*(d/100.0), -90.0, 90.0)
         stations.append({"MD": md, "Azimuth": az, "Angle": dip})
     return stations
 
@@ -158,6 +160,20 @@ def point_at_md(X, Y, Z, MDs, target_md):
     z = Z[i-1] + t*(Z[i] - Z[i-1])
     return np.array([x, y, z])
 
+def ensure_zero_station(stations, seed_from="first_survey", plan_az0=None, plan_dip0=None):
+    # If the smallest MD > 0, insert MD=0 using first survey or planned start
+    if not stations:
+        return stations
+    stations = sorted(stations, key=lambda d: float(d["MD"]))
+    if stations[0]["MD"] <= 1e-9:
+        return stations
+    if seed_from == "planned" and plan_az0 is not None and plan_dip0 is not None:
+        az0, dip0 = float(plan_az0), float(plan_dip0)
+    else:
+        az0, dip0 = float(stations[0]["Azimuth"]), float(stations[0]["Angle"])
+    stations.insert(0, {"MD": 0.0, "Azimuth": az0, "Angle": dip0})
+    return stations
+
 # ---------- UI ----------
 st.title("Drillhole vs Planned - single 3D view")
 
@@ -187,6 +203,10 @@ if method == "CSV upload":
         df_in = parse_csv_flexible(file)
         if flip_sign:
             df_in["Angle"] = -df_in["Angle"]
+        # auto flip if most angles are positive and user did not flip
+        if not flip_sign and len(df_in) > 0 and df_in["Angle"].median() > 0:
+            df_in["Angle"] = -df_in["Angle"]
+            st.info("Detected positive-down dips in CSV. Converted to negative-down.")
         st.caption(f"Loaded {len(df_in)} survey rows")
         st.dataframe(df_in.head(10), use_container_width=True)
     else:
@@ -208,6 +228,10 @@ actual_stations_base = [
     for _, r in pd.DataFrame(df_in).dropna(subset=["MD","Azimuth","Angle"]).iterrows()
 ]
 
+# enforce MD=0
+seed_mode = st.selectbox("If CSV starts after 0 m, seed MD=0 using", options=["first_survey", "planned"], index=0)
+actual_stations_base = ensure_zero_station(actual_stations_base, seed_from=seed_mode, plan_az0=plan_az0, plan_dip0=plan_dip0)
+
 # suggested lift/drift from last 3
 sug_lift, sug_drift = derive_lift_drift_last3(actual_stations_base) if len(actual_stations_base) >= 3 else (None, None)
 
@@ -224,9 +248,12 @@ with colR1:
 with colR2:
     rem_drift = st.number_input("Remaining avg drift deg/100m", value=(sug_drift if sug_drift is not None else -1.0), step=0.1)
 
-# extend actual to planned length
+# extension toggle
+extend_to_plan = st.checkbox("Extend actual to planned length", value=True)
+
+# extend actual to planned length if chosen
 actual_stations = actual_stations_base.copy()
-if actual_stations:
+if actual_stations and extend_to_plan:
     last_md = sorted(actual_stations, key=lambda d: d["MD"])[-1]["MD"]
     if plan_len > last_md + 1e-6:
         actual_stations = extend_actual(actual_stations, plan_len, step_m, rem_lift, rem_drift)
@@ -330,4 +357,5 @@ fig3d.update_layout(
 )
 st.plotly_chart(fig3d, use_container_width=True)
 
-st.caption("Angles are dip-from-horizontal. Negative values point down. Target plane is positioned by downhole MD on the planned hole.")
+st.caption("Angles are dip-from-horizontal. Negative values point down. Target plane is positioned by downhole MD on the planned hole. If CSV does not start at 0 m, a 0 m station is inserted.")
+
