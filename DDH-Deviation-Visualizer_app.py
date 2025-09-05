@@ -358,4 +358,3 @@ fig3d.update_layout(
 st.plotly_chart(fig3d, use_container_width=True)
 
 st.caption("Angles are dip-from-horizontal. Negative values point down. Target plane is positioned by downhole MD on the planned hole. If CSV does not start at 0 m, a 0 m station is inserted.")
-
