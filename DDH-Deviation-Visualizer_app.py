@@ -2,36 +2,29 @@ import numpy as np
 import matplotlib.pyplot as plt
 import streamlit as st
 
-# --------------- GEOMETRY HELPERS ---------------
+# ----------------- GEOMETRY -----------------
 
 def generate_segment(xyz0, dip_deg, az_deg, seg_len):
-    """
-    x east, y north, z elevation (up). Positive dip is down.
-    Drilling down decreases elevation -> dz negative.
-    """
-    dip_rad = np.radians(dip_deg)
-    az_rad = np.radians(az_deg)
-    dx = seg_len * np.sin(az_rad) * np.cos(dip_rad)
-    dy = seg_len * np.cos(az_rad) * np.cos(dip_rad)
-    dz = -seg_len * np.sin(dip_rad)
+    # x east, y north, z elevation (up). Positive dip = down, so dz is negative.
+    dip = np.radians(dip_deg)
+    az  = np.radians(az_deg)
+    dx = seg_len * np.sin(az) * np.cos(dip)
+    dy = seg_len * np.cos(az) * np.cos(dip)
+    dz = -seg_len * np.sin(dip)
     return xyz0 + np.array([dx, dy, dz])
 
-def plane_normal_from_strike_dip(strike, dip):
-    """
-    strike clockwise from north, dip positive down. z is elevation (up).
-    """
-    dipdir = (strike + 90.0) % 360.0
-    dip_rad = np.radians(dip)
-    dipdir_rad = np.radians(dipdir)
-    nx = np.sin(dip_rad) * np.sin(dipdir_rad)
-    ny = np.sin(dip_rad) * np.cos(dipdir_rad)
-    nz = -np.cos(dip_rad)
+def plane_normal_from_strike_dip(strike_deg, dip_deg):
+    # strike clockwise from north, dip positive down
+    dipdir = (strike_deg + 90.0) % 360.0
+    dip = np.radians(dip_deg)
+    dipdir = np.radians(dipdir)
+    nx = np.sin(dip) * np.sin(dipdir)
+    ny = np.sin(dip) * np.cos(dipdir)
+    nz = -np.cos(dip)
     return np.array([nx, ny, nz])
 
 def segment_plane_intersect(p1, p2, n, p0):
-    """
-    Intersect segment p1->p2 with plane n•(r - p0) = 0. Return point or None.
-    """
+    # intersect segment p1->p2 with plane n·(r - p0)=0
     u = p2 - p1
     denom = np.dot(n, u)
     num = np.dot(n, p0 - p1)
@@ -49,99 +42,52 @@ def polyline_plane_pierce(pts, n, p0):
             return hit
     return None
 
-def project_long_section(x, y, z, strike, dip, origin):
+# ----------------- SECTION MATH -----------------
+
+def section_basis(azimuth_deg):
+    # vertical section aligned with azimuth
+    az = np.radians(azimuth_deg)
+    u_sec = np.array([np.sin(az), np.cos(az), 0.0])  # along-section horizontal axis
+    k_up  = np.array([0.0, 0.0, 1.0])                # vertical axis
+    n_sec = np.cross(u_sec, k_up)                    # horizontal normal to the section plane
+    n_sec /= np.linalg.norm(n_sec)
+    return u_sec, k_up, n_sec
+
+def project_to_section(points_xyz, azimuth_deg, origin_xyz):
+    # orthogonal projection to section plane, then 2D coords (s, z) and off-section distance
+    u_sec, k_up, n_sec = section_basis(azimuth_deg)
+    d = points_xyz - origin_xyz
+    s = d @ u_sec                    # along-section distance from origin
+    z = points_xyz[:, 2]             # elevation stays unchanged for a vertical plane
+    off = d @ n_sec                  # signed perpendicular distance from the section plane
+    return s, z, off
+
+def target_plane_line_in_section(strike_deg, dip_deg, section_az_deg, sec_origin_xyz, p0_on_plane, s_span=600.0):
     """
-    Project to plane coordinates: along strike (s) and down-dip (d).
+    Analytic intersection of target plane with the vertical section plane.
+    Points in section plane: r = sec_origin + s*u_sec + z*k_up
+    Condition to be on target plane: n·(r - p0_on_plane) = 0
+    Solve for z(s):  (n·u_sec)*s + (n·k_up)*z + n·(sec_origin - p0) = 0
+                     z(s) = -[a*s + c]/b
     """
-    strike_rad = np.radians(strike)
-    dip_rad = np.radians(dip)
-    dipdir_rad = np.radians((strike + 90.0) % 360.0)
+    n = plane_normal_from_strike_dip(strike_deg, dip_deg)
+    u_sec, k_up, _ = section_basis(section_az_deg)
+    a = float(np.dot(n, u_sec))
+    b = float(np.dot(n, k_up))      # equals n_z
+    c = float(np.dot(n, sec_origin_xyz - p0_on_plane))
 
-    u_strike = np.array([np.sin(strike_rad), np.cos(strike_rad), 0.0])
-    u_dip = np.array([
-        np.sin(dipdir_rad) * np.cos(dip_rad),
-        np.cos(dipdir_rad) * np.cos(dip_rad),
-        -np.sin(dip_rad)
-    ])
-    coords = np.vstack([x, y, z]).T - origin
-    s = coords @ u_strike
-    d = coords @ u_dip
-    return s, d
+    s_vals = np.array([-s_span, s_span])
+    if np.isclose(b, 0.0):  # plane nearly vertical - fallback to a gentle line
+        z_vals = np.full_like(s_vals, p0_on_plane[2])
+    else:
+        z_vals = -(a * s_vals + c) / b
+    return s_vals, z_vals
 
-def project_cross_section(x, y, z, azim, origin):
-    """
-    Project to vertical section aligned with azim.
-    Returns horizontal section distance from origin and elevation z.
-    """
-    azim_rad = np.radians(azim)
-    u_sec = np.array([np.sin(azim_rad), np.cos(azim_rad), 0.0])  # in-plane horizontal axis
-    coords = np.vstack([x, y, z]).T - origin
-    sec_x = coords @ u_sec
-    return sec_x
-
-def add_end_arrow(ax, x, y, color='black'):
-    if len(x) < 2:
-        return
-    ax.quiver(x[-2], y[-2], x[-1] - x[-2], y[-1] - y[-2],
-              angles='xy', scale_units='xy', scale=1.0, width=0.01, color=color)
-
-# --------------- STREAMLIT UI ---------------
-
-st.title("DDH Deviation Visualizer")
-
-st.sidebar.header("Inputs")
-
-# Collar and globals
-collar_x = st.sidebar.number_input("Collar X (m)", value=0.0, step=0.1)
-collar_y = st.sidebar.number_input("Collar Y (m)", value=0.0, step=0.1)
-surface_elev = st.sidebar.number_input("Surface Elevation Z (m)", value=260.0, step=0.1)
-
-length = st.sidebar.number_input("Planned/EOH length MD (m)", value=730.0, step=1.0, min_value=0.0)
-target_depth = st.sidebar.number_input("Target depth MD anchor (m)", value=690.0, step=0.1, min_value=0.0)
-step = st.sidebar.number_input("Computation step (m)", value=10.0, step=1.0, min_value=1.0)
-
-# Structure plane defaults
-strike = st.sidebar.number_input("Structure strike (deg)", value=114.0, step=0.1)
-dip_struct = st.sidebar.number_input("Structure dip (deg, +down)", value=58.0, step=0.1)
-
-# Planned hole
-st.sidebar.subheader("Planned hole")
-plan_dip_in = st.sidebar.number_input("Planned dip at collar (deg, +down)", value=68.0, step=0.1)
-plan_azim = st.sidebar.number_input("Planned azimuth at collar (deg)", value=355.0, step=0.1)
-plan_lift = st.sidebar.number_input("Planned lift (deg per 100 m)", value=4.0, step=0.1)
-plan_drift = st.sidebar.number_input("Planned drift (deg per 100 m)", value=2.0, step=0.1)
-
-# Actual hole surveys
-st.sidebar.subheader("Actual hole - survey table")
-st.markdown("Enter surveys with MD, dip (+down), azimuth. Last segment will use remaining lift/drift to EOH.")
-default_rows = [
-    {"MD": 0.0, "Dip": plan_dip_in, "Azimuth": plan_azim},
-    {"MD": min(100.0, length), "Dip": plan_dip_in, "Azimuth": plan_azim},
-]
-survey_rows = st.data_editor(
-    default_rows,
-    num_rows="dynamic",
-    key="survey_table",
-    column_config={
-        "MD": st.column_config.NumberColumn("MD", step=1.0, help="Measured depth"),
-        "Dip": st.column_config.NumberColumn("Dip (+down)", step=0.1),
-        "Azimuth": st.column_config.NumberColumn("Azimuth", step=0.1),
-    }
-)
-
-st.sidebar.subheader("After last survey - remaining trend")
-rem_lift = st.sidebar.number_input("Remaining lift (deg per 100 m)", value=5.0, step=0.1)
-rem_drift = st.sidebar.number_input("Remaining drift (deg per 100 m)", value=2.0, step=0.1)
-
-# --------------- BUILD TRAJECTORIES ---------------
-
-# Collar at real surface elevation. z is elevation (up).
-collar = np.array([collar_x, collar_y, surface_elev])
+# ----------------- BUILD TRAJECTORIES -----------------
 
 def build_planned(collar_xyz, eoh_len, dip0, az0, lift_per_100, drift_per_100, step_m):
     pts = [collar_xyz.copy()]
-    dip = dip0
-    az = az0
+    dip, az = dip0, az0
     n_steps = int(max(1, np.ceil(eoh_len / step_m)))
     seg = eoh_len / n_steps
     for _ in range(n_steps):
@@ -151,10 +97,9 @@ def build_planned(collar_xyz, eoh_len, dip0, az0, lift_per_100, drift_per_100, s
         az  += (drift_per_100 / 100.0) * seg
     return np.array(pts)
 
-def build_actual_from_surveys(collar_xyz, eoh_len, survey_list, step_m, rem_lift_per_100, rem_drift_per_100):
-    # clean and sort surveys
+def build_actual_from_surveys(collar_xyz, eoh_len, survey_rows, step_m, rem_lift_per_100, rem_drift_per_100):
     clean = []
-    for r in survey_list:
+    for r in survey_rows:
         try:
             clean.append([float(r["MD"]), float(r["Dip"]), float(r["Azimuth"])])
         except Exception:
@@ -165,18 +110,17 @@ def build_actual_from_surveys(collar_xyz, eoh_len, survey_list, step_m, rem_lift
     arr = np.array(clean, dtype=float)
     arr = arr[np.argsort(arr[:, 0])]
 
-    # ensure first MD is 0 at collar
+    # ensure first at collar
     if arr[0, 0] > 0.0:
         arr = np.vstack([[0.0, arr[0, 1], arr[0, 2]], arr])
-
-    # cap last survey at or before EOH
+    # cap last at EOH if needed
     if arr[-1, 0] > eoh_len:
         arr[-1, 0] = eoh_len
 
     pts = [collar_xyz.copy()]
     md_curr = 0.0
 
-    # between surveys: linear interp dip/az
+    # interpolate between surveys
     for i in range(len(arr) - 1):
         md1, dip1, az1 = arr[i]
         md2, dip2, az2 = arr[i + 1]
@@ -192,12 +136,11 @@ def build_actual_from_surveys(collar_xyz, eoh_len, survey_list, step_m, rem_lift
             pts.append(generate_segment(pts[-1], dip_k, az_k, seg))
             md_curr += seg
 
-    # after last survey: apply remaining lift/drift to EOH
+    # continue with remaining lift/drift
     if md_curr < eoh_len:
         remaining = eoh_len - md_curr
         n_steps = max(1, int(np.ceil(remaining / step_m)))
         seg = remaining / n_steps
-        # start from the last specified orientation
         dip_curr = arr[-1, 1]
         az_curr  = arr[-1, 2]
         for _ in range(n_steps):
@@ -207,109 +150,159 @@ def build_actual_from_surveys(collar_xyz, eoh_len, survey_list, step_m, rem_lift
 
     return np.array(pts)
 
-# Build traces
+# ----------------- STREAMLIT UI -----------------
+
+st.title("DDH Deviation Visualizer - true vertical section")
+
+st.sidebar.header("Inputs")
+
+# Collar and globals
+collar_x = st.sidebar.number_input("Collar X (m)", value=0.0, step=0.1)
+collar_y = st.sidebar.number_input("Collar Y (m)", value=0.0, step=0.1)
+surface_elev = st.sidebar.number_input("Surface Elevation Z (m)", value=260.0, step=0.1)
+
+length = st.sidebar.number_input("Planned - EOH length MD (m)", value=730.0, step=1.0, min_value=0.0)
+target_depth = st.sidebar.number_input("Target MD anchor for plane (m)", value=690.0, step=0.1, min_value=0.0)
+step = st.sidebar.number_input("Computation step (m)", value=10.0, step=1.0, min_value=1.0)
+
+# Section controls
+section_half_width = st.sidebar.number_input("Section half width for clipping (m)", value=200.0, step=10.0, min_value=0.0)
+
+# Structure plane defaults
+strike = st.sidebar.number_input("Structure strike (deg)", value=114.0, step=0.1)
+dip_struct = st.sidebar.number_input("Structure dip (deg, +down)", value=58.0, step=0.1)
+
+# Planned hole
+st.sidebar.subheader("Planned hole")
+plan_dip_in = st.sidebar.number_input("Planned dip at collar (deg, +down)", value=68.0, step=0.1)
+plan_azim = st.sidebar.number_input("Planned azimuth at collar (deg)", value=355.0, step=0.1)
+plan_lift = st.sidebar.number_input("Planned lift (deg per 100 m)", value=4.0, step=0.1)
+plan_drift = st.sidebar.number_input("Planned drift (deg per 100 m)", value=2.0, step=0.1)
+
+# Actual hole surveys
+st.sidebar.subheader("Actual hole - survey table")
+st.markdown("Enter surveys with MD, dip (+down), azimuth. Remaining lift/drift applies after the last row.")
+default_rows = [
+    {"MD": 0.0, "Dip": plan_dip_in, "Azimuth": plan_azim},
+    {"MD": min(100.0, length), "Dip": plan_dip_in, "Azimuth": plan_azim},
+]
+survey_rows = st.data_editor(
+    default_rows,
+    num_rows="dynamic",
+    key="survey_table",
+    column_config={
+        "MD": st.column_config.NumberColumn("MD", step=1.0),
+        "Dip": st.column_config.NumberColumn("Dip (+down)", step=0.1),
+        "Azimuth": st.column_config.NumberColumn("Azimuth", step=0.1),
+    }
+)
+
+st.sidebar.subheader("After last survey - remaining trend")
+rem_lift = st.sidebar.number_input("Remaining lift (deg per 100 m)", value=5.0, step=0.1)
+rem_drift = st.sidebar.number_input("Remaining drift (deg per 100 m)", value=2.0, step=0.1)
+
+# ----------------- BUILD AND PROJECT -----------------
+
+collar = np.array([collar_x, collar_y, surface_elev])
+
 plan_pts = build_planned(collar, length, plan_dip_in, plan_azim, plan_lift, plan_drift, step)
 act_pts  = build_actual_from_surveys(collar, length, survey_rows, step, rem_lift, rem_drift)
 
-x_plan, y_plan, z_plan = plan_pts[:, 0], plan_pts[:, 1], plan_pts[:, 2]
-x_act,  y_act,  z_act  = act_pts[:, 0],  act_pts[:, 1],  act_pts[:, 2]
-
-# Target plane anchor from planned at target_depth
+# target plane anchored at planned point near target MD
 idx_target = int(np.clip(np.floor(target_depth / step), 0, len(plan_pts) - 1))
 target_point = plan_pts[idx_target]
 n_plane = plane_normal_from_strike_dip(strike, dip_struct)
 
-# Pierce points
+# pierce points
 pp_plan = polyline_plane_pierce(plan_pts, n_plane, target_point)
 pp_act  = polyline_plane_pierce(act_pts,  n_plane, target_point)
 
-# --------------- SECTION PLANE MATH ---------------
+# section projection
+sec_origin = collar.copy()  # section plane goes through the collar
+s_plan, z_plan, off_plan = project_to_section(plan_pts, plan_azim, sec_origin)
+s_act,  z_act,  off_act  = project_to_section(act_pts,  plan_azim, sec_origin)
 
-# Vertical section plane aligned with planned azimuth
-az_rad = np.radians(plan_azim)
-u_sec = np.array([np.sin(az_rad), np.cos(az_rad), 0.0])   # along-section horizontal
-k_up  = np.array([0.0, 0.0, 1.0])                         # vertical
-# plane normal for the vertical section: perpendicular to u_sec, in horizontal plane
-n_sec = np.cross(u_sec, k_up)  # this is horizontal, pointing 90 deg left of u_sec
+# clip to section half width
+mask_plan = np.abs(off_plan) <= section_half_width
+mask_act  = np.abs(off_act)  <= section_half_width
 
-# Line of intersection between target plane and section plane
-# direction is cross of the two normals
-v_line = np.cross(n_plane, n_sec)
-if np.linalg.norm(v_line) > 0:
-    v_line = v_line / np.linalg.norm(v_line)
+# pierce points in section
+def project_point_to_section(p):
+    s, z, off = project_to_section(p.reshape(1,3), plan_azim, sec_origin)
+    return float(s[0]), float(z[0]), float(off[0])
 
-# --------------- PLOTTING ---------------
+pp_plan_szo = project_point_to_section(pp_plan) if pp_plan is not None else None
+pp_act_szo  = project_point_to_section(pp_act)  if pp_act  is not None else None
+
+# target plane line inside the section
+s_line, z_line = target_plane_line_in_section(
+    strike, dip_struct, plan_azim, sec_origin, p0_on_plane=target_point, s_span=1000.0
+)
+
+# ----------------- PLOTTING -----------------
 
 fig, axs = plt.subplots(3, 1, figsize=(10, 18))
 
-# Long section in the structure plane
-ls_plan_s, ls_plan_d = project_long_section(x_plan, y_plan, z_plan, strike, dip_struct, origin=np.zeros(3))
-ls_act_s,  ls_act_d  = project_long_section(x_act,  y_act,  z_act,  strike, dip_struct, origin=np.zeros(3))
+# 1) Long section in the structure plane - keep as before for context
+def project_long_section(x, y, z, strike, dip, origin):
+    strike_rad = np.radians(strike)
+    dip_rad = np.radians(dip)
+    dipdir_rad = np.radians((strike + 90.0) % 360.0)
+    u_strike = np.array([np.sin(strike_rad), np.cos(strike_rad), 0.0])
+    u_dip = np.array([
+        np.sin(dipdir_rad) * np.cos(dip_rad),
+        np.cos(dipdir_rad) * np.cos(dip_rad),
+        -np.sin(dip_rad)
+    ])
+    coords = np.vstack([x, y, z]).T - origin
+    s = coords @ u_strike
+    d = coords @ u_dip
+    return s, d
+
+ls_plan_s, ls_plan_d = project_long_section(plan_pts[:,0], plan_pts[:,1], plan_pts[:,2], strike, dip_struct, origin=np.zeros(3))
+ls_act_s,  ls_act_d  = project_long_section(act_pts[:,0],  act_pts[:,1],  act_pts[:,2],  strike, dip_struct, origin=np.zeros(3))
 axs[0].plot(ls_plan_s, ls_plan_d, label='Planned')
 axs[0].plot(ls_act_s,  ls_act_d,  '--', label='Actual')
 
 if pp_plan is not None:
-    s_pp_plan, d_pp_plan = project_long_section(
+    s_ppp, d_ppp = project_long_section(
         np.array([pp_plan[0]]), np.array([pp_plan[1]]), np.array([pp_plan[2]]),
         strike, dip_struct, origin=np.zeros(3)
     )
-    axs[0].plot(s_pp_plan, d_pp_plan, 'x', color='red', markersize=10)
+    axs[0].plot(s_ppp, d_ppp, 'x', color='red', markersize=10)
 if pp_act is not None:
-    s_pp_act, d_pp_act = project_long_section(
+    s_ppa, d_ppa = project_long_section(
         np.array([pp_act[0]]), np.array([pp_act[1]]), np.array([pp_act[2]]),
         strike, dip_struct, origin=np.zeros(3)
     )
-    axs[0].plot(s_pp_act, d_pp_act, 'x', color='purple', markersize=10)
+    axs[0].plot(s_ppa, d_ppa, 'x', color='purple', markersize=10)
 
 if pp_plan is not None and pp_act is not None:
-    axs[0].plot([s_pp_plan[0], s_pp_act[0]], [d_pp_plan[0], d_pp_act[0]], 'k--')
-    dist_3d = np.linalg.norm(pp_plan - pp_act)
-    midx = 0.5 * (s_pp_plan[0] + s_pp_act[0])
-    midy = 0.5 * (d_pp_plan[0] + d_pp_act[0])
-    axs[0].text(midx, midy, f"{dist_3d:.1f} m (3D)", ha='center', va='bottom', fontsize=12, fontweight='bold')
+    axs[0].plot([s_ppp[0], s_ppa[0]], [d_ppp[0], d_ppa[0]], 'k--')
 else:
     st.info("No long-section pierce point for one or both traces.")
 
-add_end_arrow(axs[0], ls_plan_s, ls_plan_d, 'blue')
-add_end_arrow(axs[0], ls_act_s,  ls_act_d,  'orange')
 axs[0].set_xlabel('Along strike (m)')
 axs[0].set_ylabel('Down dip (m)')
 axs[0].invert_yaxis()
 axs[0].legend()
 axs[0].set_title('Long section - structure plane')
 
-# Cross section - true vertical section along planned azimuth, origin at collar
-sec_origin = collar.copy()
-sec_plan_x = project_cross_section(x_plan, y_plan, z_plan, plan_azim, sec_origin)
-sec_act_x  = project_cross_section(x_act,  y_act,  z_act,  plan_azim, sec_origin)
+# 2) True vertical section along planned azimuth
+axs[1].plot(s_plan[mask_plan], z_plan[mask_plan], label='Planned')
+axs[1].plot(s_act[mask_act],   z_act[mask_act],   '--', label='Actual')
 
-axs[1].plot(sec_plan_x, z_plan, label='Planned')
-axs[1].plot(sec_act_x,  z_act,  '--', label='Actual')
+# pierce points in section
+if pp_plan_szo is not None and abs(pp_plan_szo[2]) <= section_half_width:
+    axs[1].plot(pp_plan_szo[0], pp_plan_szo[1], 'x', color='red', markersize=10)
+if pp_act_szo is not None and abs(pp_act_szo[2]) <= section_half_width:
+    axs[1].plot(pp_act_szo[0], pp_act_szo[1], 'x', color='purple', markersize=10)
+if pp_plan_szo is not None and pp_act_szo is not None:
+    if abs(pp_plan_szo[2]) <= section_half_width and abs(pp_act_szo[2]) <= section_half_width:
+        axs[1].plot([pp_plan_szo[0], pp_act_szo[0]], [pp_plan_szo[1], pp_act_szo[1]], 'k--')
 
-# Plot pierce points in cross section
-if pp_plan is not None:
-    sec_pp_plan = project_cross_section(
-        np.array([pp_plan[0]]), np.array([pp_plan[1]]), np.array([pp_plan[2]]), plan_azim, sec_origin
-    )
-    axs[1].plot(sec_pp_plan, pp_plan[2], 'x', color='red', markersize=10)
-if pp_act is not None:
-    sec_pp_act = project_cross_section(
-        np.array([pp_act[0]]), np.array([pp_act[1]]), np.array([pp_act[2]]), plan_azim, sec_origin
-    )
-    axs[1].plot(sec_pp_act, pp_act[2], 'x', color='purple', markersize=10)
-
-if pp_plan is not None and pp_act is not None:
-    axs[1].plot([sec_pp_plan[0], sec_pp_act[0]], [pp_plan[2], pp_act[2]], 'k--')
-
-# Draw exact intersection line of target plane with the vertical section plane
-if pp_plan is not None and np.linalg.norm(v_line) > 0:
-    # build a line centered at the planned pierce point
-    span = 400.0
-    pA = pp_plan - span * v_line
-    pB = pp_plan + span * v_line
-    xsA = project_cross_section(np.array([pA[0]]), np.array([pA[1]]), np.array([pA[2]]), plan_azim, sec_origin)[0]
-    xsB = project_cross_section(np.array([pB[0]]), np.array([pB[1]]), np.array([pB[2]]), plan_azim, sec_origin)[0]
-    axs[1].plot([xsA, xsB], [pA[2], pB[2]], 'g-', label='Target plane')
+# target plane exact trace within the section
+axs[1].plot(s_line, z_line, 'g-', label='Target plane')
 
 axs[1].set_xlabel('Section distance from collar (m)')
 axs[1].set_ylabel('Elevation (m)')
@@ -317,27 +310,13 @@ axs[1].invert_yaxis()
 axs[1].legend()
 axs[1].set_title('Cross section - along planned azimuth')
 
-# Plan view
-axs[2].plot(x_plan, y_plan, label='Planned')
-axs[2].plot(x_act,  y_act,  '--', label='Actual')
+# 3) Plan view
+axs[2].plot(plan_pts[:,0], plan_pts[:,1], label='Planned')
+axs[2].plot(act_pts[:,0],  act_pts[:,1],  '--', label='Actual')
 if pp_plan is not None:
     axs[2].plot(pp_plan[0], pp_plan[1], 'x', color='red', markersize=10)
 if pp_act is not None:
     axs[2].plot(pp_act[0], pp_act[1], 'x', color='purple', markersize=10)
-if pp_plan is not None and pp_act is not None:
-    axs[2].plot([pp_plan[0], pp_act[0]], [pp_plan[1], pp_act[1]], 'k--')
-
-# strike line through planned pierce for context
-if pp_plan is not None:
-    plane_extent = 300.0
-    strike_rad = np.radians(strike)
-    dx = np.sin(strike_rad) * plane_extent
-    dy = np.cos(strike_rad) * plane_extent
-    axs[2].plot([pp_plan[0] - dx, pp_plan[0] + dx],
-                [pp_plan[1] - dy, pp_plan[1] + dy], 'g-', label='Target plane')
-
-add_end_arrow(axs[2], x_plan, y_plan, 'blue')
-add_end_arrow(axs[2], x_act,  y_act,  'orange')
 axs[2].set_xlabel('X (m)')
 axs[2].set_ylabel('Y (m)')
 axs[2].legend()
@@ -349,4 +328,10 @@ for ax in axs:
 
 plt.tight_layout()
 st.pyplot(fig)
+
+# Optional diagnostics
+st.caption(
+    f"Max off-section distance - planned: {np.nanmax(np.abs(off_plan)):.1f} m, actual: {np.nanmax(np.abs(off_act)):.1f} m. "
+    f"Points beyond ±{section_half_width:.0f} m are clipped from the section."
+)
 
