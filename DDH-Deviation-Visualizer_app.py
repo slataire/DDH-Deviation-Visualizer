@@ -4,8 +4,7 @@
 # Distance between pierce points if available
 pierce_distance = None
 if pt_actual_pierce is not None:
-pierce_distance = float(np.linalg.norm(pt_actual_pierce - pt_planned_pierce))
-
+    pierce_distance = float(np.linalg.norm(pt_actual_pierce - pt_planned_pierce))
 
 # 3D Plot
 fig = go.Figure()
@@ -99,3 +98,4 @@ st.markdown(
 - Reduce the computation step for a smoother curve and more precise intersections.
 """
 )
+
