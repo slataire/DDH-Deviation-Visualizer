@@ -52,7 +52,7 @@ def min_curvature_path(stations):
     return np.array(X), np.array(Y), np.array(Z), MDs
 
 def make_planned_stations(length_m, step_m, az0, dip0, lift_per100, drift_per100):
-    # negative lift makes the hole come up toward 0 dip (less negative)
+    # negative lift makes the hole come up toward 0 dip
     md = 0.0
     az = wrap_az(az0)
     dip = clamp(dip0, -90.0, 90.0)
@@ -139,16 +139,29 @@ def parse_csv_flexible(file):
         return pd.DataFrame(columns=["MD","Azimuth","Angle"])
     out = df[[c_md, c_az, c_an]].copy()
     out.columns = ["MD","Azimuth","Angle"]
-    # coerce numeric
     for c in ["MD","Azimuth","Angle"]:
         out[c] = pd.to_numeric(out[c], errors="coerce")
     out = out.dropna(subset=["MD","Azimuth","Angle"])
     return out
 
+def point_at_md(X, Y, Z, MDs, target_md):
+    # linear interpolation along the computed path
+    tmd = float(clamp(target_md, float(MDs.min()), float(MDs.max())))
+    i = int(np.searchsorted(MDs, tmd))
+    if i <= 0:
+        return np.array([X[0], Y[0], Z[0]])
+    if i >= len(MDs):
+        return np.array([X[-1], Y[-1], Z[-1]])
+    t = (tmd - MDs[i-1]) / (MDs[i] - MDs[i-1] + 1e-12)
+    x = X[i-1] + t*(X[i] - X[i-1])
+    y = Y[i-1] + t*(Y[i] - Y[i-1])
+    z = Z[i-1] + t*(Z[i] - Z[i-1])
+    return np.array([x, y, z])
+
 # ---------- UI ----------
 st.title("Drillhole vs Planned - single 3D view")
 
-# planned inputs - defaults set to trend up and to the right (negative lift and drift)
+# planned inputs - defaults negative so it trends up and to the right
 colA, colB, colC = st.columns(3)
 with colA:
     plan_len = st.number_input("Planned length m", value=500.0, step=10.0, min_value=1.0)
@@ -157,17 +170,18 @@ with colB:
     plan_az0 = st.number_input("Planned start azimuth deg", value=90.0, step=1.0)
     plan_dip0 = st.number_input("Planned start dip-from-horizontal deg (negative down)", value=-60.0, step=1.0)
 with colC:
-    plan_lift = st.number_input("Planned lift deg/100m", value=-2.0, step=0.1)   # negative by default
-    plan_drift = st.number_input("Planned drift deg/100m", value=-1.0, step=0.1) # negative by default
+    plan_lift = st.number_input("Planned lift deg/100m", value=-2.0, step=0.1)
+    plan_drift = st.number_input("Planned drift deg/100m", value=-1.0, step=0.1)
 
 planned_stations = make_planned_stations(plan_len, step_m, plan_az0, plan_dip0, plan_lift, plan_drift)
 px, py, pz, pmd = min_curvature_path(planned_stations)
+plan_pts = np.column_stack([px, py, pz])
 
 # actual surveys
 st.subheader("Actual surveys")
 method = st.radio("Provide surveys via", ["CSV upload", "Manual entry"], horizontal=True)
 if method == "CSV upload":
-    file = st.file_uploader("Upload CSV (MD, Azimuth, Angle). Example headers accepted: MD, Azimuth, Angle -or- Measured Depth, Azi, Dip", type=["csv"])
+    file = st.file_uploader("Upload CSV (MD, Azimuth, Angle). Example headers accepted: MD, Azimuth, Angle or Measured Depth, Azi, Dip", type=["csv"])
     flip_sign = st.checkbox("CSV angle is positive-down - flip sign to negative-down", value=False)
     if file is not None:
         df_in = parse_csv_flexible(file)
@@ -200,15 +214,9 @@ sug_lift, sug_drift = derive_lift_drift_last3(actual_stations_base) if len(actua
 st.markdown("#### Remaining average lift and drift after last survey")
 colS1, colS2 = st.columns(2)
 with colS1:
-    if sug_lift is not None:
-        st.caption(f"Suggested lift from last 3: {sug_lift:.2f} deg/100m")
-    else:
-        st.caption("Suggested lift needs at least 3 surveys")
+    st.caption(f"Suggested lift from last 3: {sug_lift:.2f} deg/100m" if sug_lift is not None else "Suggested lift needs at least 3 surveys")
 with colS2:
-    if sug_drift is not None:
-        st.caption(f"Suggested drift from last 3: {sug_drift:.2f} deg/100m")
-    else:
-        st.caption("Suggested drift needs at least 3 surveys")
+    st.caption(f"Suggested drift from last 3: {sug_drift:.2f} deg/100m" if sug_drift is not None else "Suggested drift needs at least 3 surveys")
 
 colR1, colR2 = st.columns(2)
 with colR1:
@@ -224,25 +232,30 @@ if actual_stations:
         actual_stations = extend_actual(actual_stations, plan_len, step_m, rem_lift, rem_drift)
 
 ax, ay, az, amd = min_curvature_path(actual_stations) if actual_stations else (np.array([0.0]), np.array([0.0]), np.array([0.0]), np.array([0.0]))
+act_pts = np.column_stack([ax, ay, az])
 
-# plane
-st.subheader("Target plane")
-plane_strike = st.number_input("Plane strike deg", value=114.0, step=1.0)
-plane_dip = st.number_input("Plane dip-from-horizontal deg (negative down)", value=-58.0, step=1.0)
-target_depth = st.number_input("Target depth m below collar", value=max(0.0, plan_len - 50.0), step=5.0, min_value=0.0)
+# plane defined by strike and dip, positioned by downhole MD on planned hole
+st.subheader("Target plane and pierce points")
+colP1, colP2, colP3 = st.columns(3)
+with colP1:
+    plane_strike = st.number_input("Plane strike deg", value=114.0, step=1.0)
+with colP2:
+    plane_dip = st.number_input("Plane dip-from-horizontal deg (negative down)", value=-58.0, step=1.0)
+with colP3:
+    default_md = max(0.0, plan_len - 50.0)
+    target_md = st.number_input("Target downhole MD on planned hole m", value=float(default_md), step=5.0, min_value=0.0, max_value=float(plan_len))
 
 s_hat, d_hat, n_hat = strike_dip_to_axes(plane_strike, plane_dip)
-P0 = np.array([0.0, 0.0, -float(target_depth)])
+P0 = point_at_md(px, py, pz, pmd, target_md)  # plane passes through planned hole at target MD
 
-plan_pts = np.column_stack([px, py, pz])
-act_pts = np.column_stack([ax, ay, az])
+# pierce points
 pierce_plan = find_plane_intersection(plan_pts, P0, n_hat)
 pierce_act = find_plane_intersection(act_pts, P0, n_hat)
 
 # ---------- 3D view with enlarged bounds and plane to edges ----------
 st.markdown("### 3D view")
 
-# gather bounds
+# bounds
 all_chunks = [plan_pts, act_pts, P0.reshape(1,3)]
 if pierce_plan is not None:
     all_chunks.append(pierce_plan.reshape(1,3))
@@ -263,9 +276,8 @@ yr = [ymin - pad, ymax + pad]
 zr = [zmin - pad, zmax + pad]
 
 # plane sized to cover entire axes
-# choose span to exceed the diagonal of the plotting cube so plane reaches edges
 cube_diag = np.linalg.norm([xr[1]-xr[0], yr[1]-yr[0], zr[1]-zr[0]])
-span = cube_diag  # big enough to hit plot edges
+span = cube_diag
 uu, vv = np.meshgrid(np.linspace(-span, span, 30), np.linspace(-span, span, 30))
 plane_grid = P0.reshape(1,1,3) + uu[...,None]*s_hat.reshape(1,1,3) + vv[...,None]*d_hat.reshape(1,1,3)
 
@@ -318,4 +330,4 @@ fig3d.update_layout(
 )
 st.plotly_chart(fig3d, use_container_width=True)
 
-st.caption("Notes: CSV angle is dip-from-horizontal. Negative values point down. If your CSV has positive-down dip, use the flip checkbox.")
+st.caption("Angles are dip-from-horizontal. Negative values point down. Target plane is positioned by downhole MD on the planned hole.")
