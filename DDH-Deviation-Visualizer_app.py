@@ -5,29 +5,30 @@ import plotly.graph_objects as go
 
 st.set_page_config(page_title="DDH Deviation Visualizer", layout="wide")
 
-# -----------------
-# Helper functions
-# -----------------
+# ---------- helpers ----------
 def wrap_az(az):
-    return az % 360
+    az = az % 360.0
+    if az < 0:
+        az += 360.0
+    return az
 
 def clamp(v, vmin, vmax):
     return max(vmin, min(v, vmax))
 
 def min_curvature_path(stations):
+    # stations: list of dicts with MD, Azimuth, Angle (dip-from-horizontal, negative = down)
     if not stations:
-        return np.array([0.0]), np.array([0.0]), np.array([0.0])
+        return np.array([0.0]), np.array([0.0]), np.array([0.0]), np.array([0.0])
 
     stations = sorted(stations, key=lambda d: float(d["MD"]))
-    MDs = np.array([s["MD"] for s in stations], float)
-    AZs = np.deg2rad([wrap_az(s["Azimuth"]) for s in stations])
-    DIP = np.array([s["Angle"] for s in stations], float)
+    MDs = np.array([float(s["MD"]) for s in stations], float)
+    AZs = np.deg2rad([wrap_az(float(s["Azimuth"])) for s in stations])
+    DIP = np.array([float(s["Angle"]) for s in stations], float)
 
-    INC = np.deg2rad(90 - np.abs(DIP))  # inclination-from-vertical
-    SGN = np.where(DIP <= 0.0, -1.0, 1.0)  # negative dip points down
+    INC = np.deg2rad(90.0 - np.abs(DIP))  # inclination-from-vertical
+    SGN = np.where(DIP <= 0.0, -1.0, 1.0)  # negative dip means down
 
     X, Y, Z = [0.0], [0.0], [0.0]
-
     for i in range(1, len(MDs)):
         dMD = MDs[i] - MDs[i-1]
         if dMD <= 0:
@@ -37,64 +38,73 @@ def min_curvature_path(stations):
         s1, s2 = SGN[i-1], SGN[i]
 
         cos_dog = np.sin(inc1)*np.sin(inc2)*np.cos(az2-az1) + np.cos(inc1)*np.cos(inc2)
-        cos_dog = np.clip(cos_dog, -1, 1)
+        cos_dog = float(np.clip(cos_dog, -1.0, 1.0))
         dog = np.arccos(cos_dog)
-        RF = 1 if dog < 1e-12 else (2/dog)*np.tan(dog/2)
+        RF = 1.0 if dog < 1e-12 else (2.0/dog)*np.tan(dog/2.0)
 
-        dN = 0.5*dMD*(np.sin(inc1)*np.cos(az1)+np.sin(inc2)*np.cos(az2))*RF
-        dE = 0.5*dMD*(np.sin(inc1)*np.sin(az1)+np.sin(inc2)*np.sin(az2))*RF
-        dZ = 0.5*dMD*(s1*np.cos(inc1)+s2*np.cos(inc2))*RF
+        dN = 0.5*dMD*(np.sin(inc1)*np.cos(az1) + np.sin(inc2)*np.cos(az2))*RF
+        dE = 0.5*dMD*(np.sin(inc1)*np.sin(az1) + np.sin(inc2)*np.sin(az2))*RF
+        dZ = 0.5*dMD*(s1*np.cos(inc1) + s2*np.cos(inc2))*RF  # signed vertical
 
         X.append(X[-1] + dE)
         Y.append(Y[-1] + dN)
         Z.append(Z[-1] + dZ)
-
-    return np.array(X), np.array(Y), np.array(Z)
+    return np.array(X), np.array(Y), np.array(Z), MDs
 
 def make_planned_stations(length_m, step_m, az0, dip0, lift_per100, drift_per100):
-    stations = []
-    md, az, dip = 0.0, wrap_az(az0), dip0
-    while md <= length_m:
+    # negative lift makes the hole come up toward 0 dip (less negative)
+    md = 0.0
+    az = wrap_az(az0)
+    dip = clamp(dip0, -90.0, 90.0)
+    stations = [{"MD": md, "Azimuth": az, "Angle": dip}]
+    while md < length_m - 1e-9:
+        d = min(step_m, length_m - md)
+        md += d
+        az = wrap_az(az + drift_per100*(d/100.0))
+        dip = clamp(dip - lift_per100*(d/100.0), -90.0, 90.0)  # minus because positive lift increases downward magnitude
         stations.append({"MD": md, "Azimuth": az, "Angle": dip})
-        md += step_m
-        az = wrap_az(az + drift_per100*(step_m/100))
-        dip = clamp(dip - lift_per100*(step_m/100), -90, 90)  # subtract -> more negative = steeper down
     return stations
 
 def extend_actual(stations, to_depth, step_m, lift_per100, drift_per100):
     if not stations:
         return stations
-    stations = sorted(stations, key=lambda d: d["MD"])
-    last = stations[-1]
-    md, az, dip = last["MD"], last["Azimuth"], last["Angle"]
-    while md < to_depth - 1e-6:
+    stations = sorted(stations, key=lambda d: float(d["MD"]))
+    md = float(stations[-1]["MD"])
+    az = float(stations[-1]["Azimuth"])
+    dip = float(stations[-1]["Angle"])
+    while md < to_depth - 1e-9:
         d = min(step_m, to_depth - md)
         md += d
-        az = wrap_az(az + drift_per100*(d/100))
-        dip = clamp(dip - lift_per100*(d/100), -90, 90)
+        az = wrap_az(az + drift_per100*(d/100.0))
+        dip = clamp(dip - lift_per100*(d/100.0), -90.0, 90.0)
         stations.append({"MD": md, "Azimuth": az, "Angle": dip})
     return stations
 
 def derive_lift_drift_last3(stations):
     if len(stations) < 3:
         return None, None
-    sta = sorted(stations, key=lambda d: d["MD"])[-3:]
-    MD = np.array([s["MD"] for s in sta])
-    AZ = np.array([s["Azimuth"] for s in sta])
-    DIP = np.array([s["Angle"] for s in sta])
+    sta = sorted(stations, key=lambda d: float(d["MD"]))[-3:]
+    MD = np.array([float(s["MD"]) for s in sta], float)
+    AZ = np.array([float(s["Azimuth"]) for s in sta], float)
+    DIP = np.array([float(s["Angle"]) for s in sta], float)
     AZu = np.unwrap(np.deg2rad(AZ))
-    drift = np.rad2deg(np.polyfit(MD, AZu, 1)[0]) * 100
-    lift = -np.polyfit(MD, DIP, 1)[0] * 100
-    return lift, drift
+    drift_deg_per_m = np.rad2deg(np.polyfit(MD, AZu, 1)[0])
+    # minus because positive lift increases downward magnitude, we want lift positive when trend is toward more negative dips
+    lift_deg_per_m = -np.polyfit(MD, DIP, 1)[0]
+    return float(lift_deg_per_m*100.0), float(drift_deg_per_m*100.0)
 
-def strike_dip_to_axes(strike, dip_signed):
-    strike = np.deg2rad(wrap_az(strike))
-    dip_abs = np.deg2rad(abs(dip_signed))
-    s_hat = np.array([np.sin(strike), np.cos(strike), 0])
-    dipdir = strike + np.pi/2
-    d_hat = np.array([np.sin(dipdir)*np.cos(dip_abs), np.cos(dipdir)*np.cos(dip_abs), -np.sin(dip_abs)])
+def strike_dip_to_axes(strike_deg, dip_deg_signed):
+    # X East, Y North, Z Up. Strike cw from North. Dip-from-horizontal, negative down.
+    strike = np.deg2rad(wrap_az(strike_deg))
+    dip_abs = np.deg2rad(abs(dip_deg_signed))
+    s_hat = np.array([np.sin(strike), np.cos(strike), 0.0])  # along strike
+    dipdir = strike + np.pi/2.0
+    d_hat = np.array([np.sin(dipdir)*np.cos(dip_abs), np.cos(dipdir)*np.cos(dip_abs), -np.sin(dip_abs)])  # down-dip
     n_hat = np.cross(s_hat, d_hat)
-    return s_hat/np.linalg.norm(s_hat), d_hat/np.linalg.norm(d_hat), n_hat/np.linalg.norm(n_hat)
+    s_hat /= np.linalg.norm(s_hat)
+    d_hat /= np.linalg.norm(d_hat)
+    n_hat /= np.linalg.norm(n_hat)
+    return s_hat, d_hat, n_hat
 
 def segment_plane_intersection(p0, p1, P0, n_hat):
     u = p1 - p0
@@ -102,91 +112,210 @@ def segment_plane_intersection(p0, p1, P0, n_hat):
     if abs(denom) < 1e-12:
         return None
     t = np.dot(n_hat, P0 - p0)/denom
-    if 0 <= t <= 1:
+    if 0.0 <= t <= 1.0:
         return p0 + t*u
     return None
 
-def find_plane_intersection(points, P0, n_hat):
-    for i in range(1, len(points)):
-        p = segment_plane_intersection(points[i-1], points[i], P0, n_hat)
+def find_plane_intersection(points_xyz, P0, n_hat):
+    for i in range(1, len(points_xyz)):
+        p = segment_plane_intersection(points_xyz[i-1], points_xyz[i], P0, n_hat)
         if p is not None:
             return p
     return None
 
-# -----------------
-# UI
-# -----------------
-st.title("Drillhole vs Planned with Target Plane")
+def parse_csv_flexible(file):
+    # Accept common variants: MD, Measured Depth, Azimuth/Azi/AZ, Angle/Dip/Inclination
+    df = pd.read_csv(file)
+    cols = {c.lower().strip(): c for c in df.columns}
+    def pick(*names):
+        for n in names:
+            if n in cols:
+                return cols[n]
+        return None
+    c_md = pick("md", "measured depth", "measured_depth")
+    c_az = pick("azimuth", "azi", "az")
+    c_an = pick("angle", "dip", "inclination", "incl")
+    if not all([c_md, c_az, c_an]):
+        return pd.DataFrame(columns=["MD","Azimuth","Angle"])
+    out = df[[c_md, c_az, c_an]].copy()
+    out.columns = ["MD","Azimuth","Angle"]
+    # coerce numeric
+    for c in ["MD","Azimuth","Angle"]:
+        out[c] = pd.to_numeric(out[c], errors="coerce")
+    out = out.dropna(subset=["MD","Azimuth","Angle"])
+    return out
 
-plan_len = st.number_input("Planned length (m)", value=500.0, step=10.0)
-plan_az0 = st.number_input("Planned azimuth (deg)", value=90.0)
-plan_dip0 = st.number_input("Planned dip-from-horizontal (deg, negative down)", value=-60.0)
-plan_lift = st.number_input("Planned lift (deg/100m)", value=2.0)
-plan_drift = st.number_input("Planned drift (deg/100m)", value=1.0)
-step_m = st.number_input("Step (m)", value=10.0)
+# ---------- UI ----------
+st.title("Drillhole vs Planned - single 3D view")
+
+# planned inputs - defaults set to trend up and to the right (negative lift and drift)
+colA, colB, colC = st.columns(3)
+with colA:
+    plan_len = st.number_input("Planned length m", value=500.0, step=10.0, min_value=1.0)
+    step_m = st.number_input("Computation step m", value=10.0, step=1.0, min_value=1.0)
+with colB:
+    plan_az0 = st.number_input("Planned start azimuth deg", value=90.0, step=1.0)
+    plan_dip0 = st.number_input("Planned start dip-from-horizontal deg (negative down)", value=-60.0, step=1.0)
+with colC:
+    plan_lift = st.number_input("Planned lift deg/100m", value=-2.0, step=0.1)   # negative by default
+    plan_drift = st.number_input("Planned drift deg/100m", value=-1.0, step=0.1) # negative by default
 
 planned_stations = make_planned_stations(plan_len, step_m, plan_az0, plan_dip0, plan_lift, plan_drift)
-px, py, pz = min_curvature_path(planned_stations)
+px, py, pz, pmd = min_curvature_path(planned_stations)
 
+# actual surveys
 st.subheader("Actual surveys")
-method = st.radio("Input surveys", ["Manual", "CSV"], horizontal=True)
-if method == "CSV":
-    file = st.file_uploader("Upload CSV with MD, Azimuth, Angle", type="csv")
-    if file:
-        df = pd.read_csv(file)
+method = st.radio("Provide surveys via", ["CSV upload", "Manual entry"], horizontal=True)
+if method == "CSV upload":
+    file = st.file_uploader("Upload CSV (MD, Azimuth, Angle). Example headers accepted: MD, Azimuth, Angle -or- Measured Depth, Azi, Dip", type=["csv"])
+    flip_sign = st.checkbox("CSV angle is positive-down - flip sign to negative-down", value=False)
+    if file is not None:
+        df_in = parse_csv_flexible(file)
+        if flip_sign:
+            df_in["Angle"] = -df_in["Angle"]
+        st.caption(f"Loaded {len(df_in)} survey rows")
+        st.dataframe(df_in.head(10), use_container_width=True)
     else:
-        df = pd.DataFrame(columns=["MD","Azimuth","Angle"])
+        df_in = pd.DataFrame(columns=["MD","Azimuth","Angle"])
 else:
-    df = st.data_editor(pd.DataFrame([{"MD":0,"Azimuth":plan_az0,"Angle":plan_dip0}]), num_rows="dynamic")
+    df_in = st.data_editor(
+        pd.DataFrame(
+            [
+                {"MD": 0.0, "Azimuth": plan_az0, "Angle": plan_dip0},
+                {"MD": 50.0, "Azimuth": plan_az0, "Angle": plan_dip0},
+            ]
+        ),
+        num_rows="dynamic",
+        use_container_width=True,
+    )
 
-actual_stations = df.dropna().to_dict("records")
-sug_lift, sug_drift = derive_lift_drift_last3(actual_stations)
+actual_stations_base = [
+    {"MD": float(r["MD"]), "Azimuth": float(r["Azimuth"]), "Angle": float(r["Angle"])}
+    for _, r in pd.DataFrame(df_in).dropna(subset=["MD","Azimuth","Angle"]).iterrows()
+]
 
-st.write("Suggested from last 3:", f"Lift {sug_lift:.2f}" if sug_lift else "-", f"Drift {sug_drift:.2f}" if sug_drift else "-")
+# suggested lift/drift from last 3
+sug_lift, sug_drift = derive_lift_drift_last3(actual_stations_base) if len(actual_stations_base) >= 3 else (None, None)
 
-rem_lift = st.number_input("Remaining avg lift (deg/100m)", value=sug_lift if sug_lift else 2.0)
-rem_drift = st.number_input("Remaining avg drift (deg/100m)", value=sug_drift if sug_drift else 1.0)
+st.markdown("#### Remaining average lift and drift after last survey")
+colS1, colS2 = st.columns(2)
+with colS1:
+    if sug_lift is not None:
+        st.caption(f"Suggested lift from last 3: {sug_lift:.2f} deg/100m")
+    else:
+        st.caption("Suggested lift needs at least 3 surveys")
+with colS2:
+    if sug_drift is not None:
+        st.caption(f"Suggested drift from last 3: {sug_drift:.2f} deg/100m")
+    else:
+        st.caption("Suggested drift needs at least 3 surveys")
 
+colR1, colR2 = st.columns(2)
+with colR1:
+    rem_lift = st.number_input("Remaining avg lift deg/100m", value=(sug_lift if sug_lift is not None else -2.0), step=0.1)
+with colR2:
+    rem_drift = st.number_input("Remaining avg drift deg/100m", value=(sug_drift if sug_drift is not None else -1.0), step=0.1)
+
+# extend actual to planned length
+actual_stations = actual_stations_base.copy()
 if actual_stations:
-    actual_stations = extend_actual(actual_stations, plan_len, step_m, rem_lift, rem_drift)
-    ax, ay, az = min_curvature_path(actual_stations)
-else:
-    ax, ay, az = [0.0], [0.0], [0.0]
+    last_md = sorted(actual_stations, key=lambda d: d["MD"])[-1]["MD"]
+    if plan_len > last_md + 1e-6:
+        actual_stations = extend_actual(actual_stations, plan_len, step_m, rem_lift, rem_drift)
 
-# Plane
+ax, ay, az, amd = min_curvature_path(actual_stations) if actual_stations else (np.array([0.0]), np.array([0.0]), np.array([0.0]), np.array([0.0]))
+
+# plane
 st.subheader("Target plane")
-plane_strike = st.number_input("Plane strike (deg)", value=114.0)
-plane_dip = st.number_input("Plane dip-from-horizontal (deg, negative down)", value=-58.0)
-target_depth = st.number_input("Target depth (m)", value=plan_len-50)
+plane_strike = st.number_input("Plane strike deg", value=114.0, step=1.0)
+plane_dip = st.number_input("Plane dip-from-horizontal deg (negative down)", value=-58.0, step=1.0)
+target_depth = st.number_input("Target depth m below collar", value=max(0.0, plan_len - 50.0), step=5.0, min_value=0.0)
 
 s_hat, d_hat, n_hat = strike_dip_to_axes(plane_strike, plane_dip)
-P0 = np.array([0,0,-target_depth])
+P0 = np.array([0.0, 0.0, -float(target_depth)])
 
 plan_pts = np.column_stack([px, py, pz])
 act_pts = np.column_stack([ax, ay, az])
 pierce_plan = find_plane_intersection(plan_pts, P0, n_hat)
 pierce_act = find_plane_intersection(act_pts, P0, n_hat)
 
-# 3D plot
-fig = go.Figure()
-fig.add_trace(go.Scatter3d(x=px,y=py,z=pz,mode="lines",name="Planned"))
-fig.add_trace(go.Scatter3d(x=ax,y=ay,z=az,mode="lines",name="Actual"))
-fig.add_trace(go.Scatter3d(x=[0],y=[0],z=[0],mode="markers",name="Collar"))
+# ---------- 3D view with enlarged bounds and plane to edges ----------
+st.markdown("### 3D view")
 
-# Plane patch
-span=0.3*plan_len
-uu,vv=np.meshgrid(np.linspace(-span,span,10),np.linspace(-span,span,10))
-grid=P0+uu[...,None]*s_hat+vv[...,None]*d_hat
-fig.add_trace(go.Surface(x=grid[...,0],y=grid[...,1],z=grid[...,2],opacity=0.4,showscale=False,name="Target plane"))
-
-# Pierce points and connector
+# gather bounds
+all_chunks = [plan_pts, act_pts, P0.reshape(1,3)]
 if pierce_plan is not None:
-    fig.add_trace(go.Scatter3d(x=[pierce_plan[0]],y=[pierce_plan[1]],z=[pierce_plan[2]],mode="markers",name="Pierce planned"))
+    all_chunks.append(pierce_plan.reshape(1,3))
 if pierce_act is not None:
-    fig.add_trace(go.Scatter3d(x=[pierce_act[0]],y=[pierce_act[1]],z=[pierce_act[2]],mode="markers",name="Pierce actual"))
-if pierce_plan is not None and pierce_act is not None:
-    fig.add_trace(go.Scatter3d(x=[pierce_plan[0],pierce_act[0]],y=[pierce_plan[1],pierce_act[1]],z=[pierce_plan[2],pierce_act[2]],mode="lines",name="Pierce separation",line=dict(dash="dash")))
-    st.info(f"Pierce separation on plane: {np.linalg.norm((pierce_act-pierce_plan) - np.dot((pierce_act-pierce_plan), n_hat)*n_hat):.2f} m")
+    all_chunks.append(pierce_act.reshape(1,3))
+ALL = np.vstack(all_chunks)
+xmin, ymin, zmin = np.min(ALL, axis=0)
+xmax, ymax, zmax = np.max(ALL, axis=0)
 
-fig.update_layout(scene=dict(xaxis_title="X",yaxis_title="Y",zaxis_title="Z (up)"),margin=dict(l=0,r=0,b=0,t=0))
-st.plotly_chart(fig, use_container_width=True)
+range_x = xmax - xmin
+range_y = ymax - ymin
+range_z = zmax - zmin
+max_span = max(range_x, range_y, range_z, 1.0)
+pad = max(0.25*max_span, 25.0)
+
+xr = [xmin - pad, xmax + pad]
+yr = [ymin - pad, ymax + pad]
+zr = [zmin - pad, zmax + pad]
+
+# plane sized to cover entire axes
+# choose span to exceed the diagonal of the plotting cube so plane reaches edges
+cube_diag = np.linalg.norm([xr[1]-xr[0], yr[1]-yr[0], zr[1]-zr[0]])
+span = cube_diag  # big enough to hit plot edges
+uu, vv = np.meshgrid(np.linspace(-span, span, 30), np.linspace(-span, span, 30))
+plane_grid = P0.reshape(1,1,3) + uu[...,None]*s_hat.reshape(1,1,3) + vv[...,None]*d_hat.reshape(1,1,3)
+
+fig3d = go.Figure()
+fig3d.add_trace(go.Scatter3d(x=px, y=py, z=pz, mode="lines", name="Planned", line=dict(width=6)))
+fig3d.add_trace(go.Scatter3d(x=ax, y=ay, z=az, mode="lines", name="Actual", line=dict(width=6)))
+fig3d.add_trace(go.Scatter3d(x=[0], y=[0], z=[0], mode="markers", name="Collar", marker=dict(size=5)))
+
+fig3d.add_trace(go.Surface(
+    x=plane_grid[...,0],
+    y=plane_grid[...,1],
+    z=plane_grid[...,2],
+    opacity=0.35,
+    showscale=False,
+    name="Target plane"
+))
+
+if pierce_plan is not None:
+    fig3d.add_trace(go.Scatter3d(
+        x=[pierce_plan[0]], y=[pierce_plan[1]], z=[pierce_plan[2]],
+        mode="markers", name="Pierce planned", marker=dict(size=6, symbol="x")
+    ))
+if pierce_act is not None:
+    fig3d.add_trace(go.Scatter3d(
+        x=[pierce_act[0]], y=[pierce_act[1]], z=[pierce_act[2]],
+        mode="markers", name="Pierce actual", marker=dict(size=6)
+    ))
+if pierce_plan is not None and pierce_act is not None:
+    fig3d.add_trace(go.Scatter3d(
+        x=[pierce_plan[0], pierce_act[0]],
+        y=[pierce_plan[1], pierce_act[1]],
+        z=[pierce_plan[2], pierce_act[2]],
+        mode="lines", name="Pierce separation", line=dict(width=3, dash="dash")
+    ))
+    # distance within plane (project connector onto plane)
+    v = pierce_act - pierce_plan
+    v_plane = v - np.dot(v, n_hat)*n_hat
+    dist_on_plane = float(np.linalg.norm(v_plane))
+    st.info(f"Pierce separation on plane: {dist_on_plane:.2f} m")
+
+fig3d.update_layout(
+    scene=dict(
+        xaxis_title="X East m", xaxis=dict(range=xr),
+        yaxis_title="Y North m", yaxis=dict(range=yr),
+        zaxis_title="Z m (up)", zaxis=dict(range=zr),
+        aspectmode="cube"
+    ),
+    margin=dict(l=0, r=0, b=0, t=0),
+    scene_camera=dict(eye=dict(x=1.8, y=1.8, z=1.2))
+)
+st.plotly_chart(fig3d, use_container_width=True)
+
+st.caption("Notes: CSV angle is dip-from-horizontal. Negative values point down. If your CSV has positive-down dip, use the flip checkbox.")
