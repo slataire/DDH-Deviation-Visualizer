@@ -125,9 +125,10 @@ def find_plane_intersection(points_xyz, P0, n_hat):
             return p
     return None
 
-def parse_csv_flexible(file):
+def parse_df_flexible(df):
     # Accept common variants: MD, Measured Depth, Azimuth/Azi/AZ, Angle/Dip/Inclination
-    df = pd.read_csv(file)
+    if df is None or df.empty:
+        return pd.DataFrame(columns=["MD","Azimuth","Angle"])
     cols = {c.lower().strip(): c for c in df.columns}
     def pick(*names):
         for n in names:
@@ -143,7 +144,7 @@ def parse_csv_flexible(file):
     out.columns = ["MD","Azimuth","Angle"]
     for c in ["MD","Azimuth","Angle"]:
         out[c] = pd.to_numeric(out[c], errors="coerce")
-    out = out.dropna(subset=["MD","Azimuth","Angle"])
+    out = out.dropna(subset=["MD","Azimuth","Angle"]).sort_values("MD").reset_index(drop=True)
     return out
 
 def point_at_md(X, Y, Z, MDs, target_md):
@@ -160,24 +161,34 @@ def point_at_md(X, Y, Z, MDs, target_md):
     z = Z[i-1] + t*(Z[i] - Z[i-1])
     return np.array([x, y, z])
 
-def ensure_zero_station(stations, seed_from="first_survey", plan_az0=None, plan_dip0=None):
-    # If the smallest MD > 0, insert MD=0 using first survey or planned start
-    if not stations:
-        return stations
-    stations = sorted(stations, key=lambda d: float(d["MD"]))
-    if stations[0]["MD"] <= 1e-9:
-        return stations
-    if seed_from == "planned" and plan_az0 is not None and plan_dip0 is not None:
-        az0, dip0 = float(plan_az0), float(plan_dip0)
-    else:
-        az0, dip0 = float(stations[0]["Azimuth"]), float(stations[0]["Angle"])
-    stations.insert(0, {"MD": 0.0, "Azimuth": az0, "Angle": dip0})
-    return stations
+def az_diff_deg(a2, a1):
+    # smallest signed difference a2 - a1 in degrees
+    d = np.deg2rad(a2) - np.deg2rad(a1)
+    d = np.arctan2(np.sin(d), np.cos(d))
+    return np.rad2deg(d)
+
+def add_delta_columns(df):
+    if df is None or df.empty:
+        return df
+    df = df.sort_values("MD").reset_index(drop=True).copy()
+    df["dMD"] = df["MD"].diff()
+    df["dAz_deg"] = df["Azimuth"].diff().fillna(0.0)
+    # correct az wrap per interval
+    df.loc[1:, "dAz_deg"] = [
+        az_diff_deg(df.loc[i, "Azimuth"], df.loc[i-1, "Azimuth"])
+        for i in range(1, len(df))
+    ]
+    df["dDip_deg"] = df["Angle"].diff()
+    # per 100 m, guard zero or negative dMD
+    with np.errstate(divide="ignore", invalid="ignore"):
+        df["Az change deg/100m"] = np.where(df["dMD"] > 0, df["dAz_deg"]/df["dMD"]*100.0, np.nan)
+        df["Dip change deg/100m"] = np.where(df["dMD"] > 0, df["dDip_deg"]/df["dMD"]*100.0, np.nan)
+    return df.drop(columns=["dMD", "dAz_deg", "dDip_deg"])
 
 # ---------- UI ----------
 st.title("Drillhole vs Planned - single 3D view")
 
-# planned inputs - defaults negative so it trends up and to the right
+# planned inputs - defaults now positive per request
 colA, colB, colC = st.columns(3)
 with colA:
     plan_len = st.number_input("Planned length m", value=500.0, step=10.0, min_value=1.0)
@@ -186,8 +197,8 @@ with colB:
     plan_az0 = st.number_input("Planned start azimuth deg", value=90.0, step=1.0)
     plan_dip0 = st.number_input("Planned start dip-from-horizontal deg (negative down)", value=-60.0, step=1.0)
 with colC:
-    plan_lift = st.number_input("Planned lift deg/100m", value=-2.0, step=0.1)
-    plan_drift = st.number_input("Planned drift deg/100m", value=-1.0, step=0.1)
+    plan_lift = st.number_input("Planned lift deg/100m", value=2.0, step=0.1)
+    plan_drift = st.number_input("Planned drift deg/100m", value=1.0, step=0.1)
 
 planned_stations = make_planned_stations(plan_len, step_m, plan_az0, plan_dip0, plan_lift, plan_drift)
 px, py, pz, pmd = min_curvature_path(planned_stations)
@@ -195,22 +206,30 @@ plan_pts = np.column_stack([px, py, pz])
 
 # actual surveys
 st.subheader("Actual surveys")
-method = st.radio("Provide surveys via", ["CSV upload", "Manual entry"], horizontal=True)
-if method == "CSV upload":
-    file = st.file_uploader("Upload CSV (MD, Azimuth, Angle). Example headers accepted: MD, Azimuth, Angle or Measured Depth, Azi, Dip", type=["csv"])
-    flip_sign = st.checkbox("CSV angle is positive-down - flip sign to negative-down", value=False)
+method = st.radio("Provide surveys via", ["Excel upload", "CSV upload", "Manual entry"], horizontal=True)
+
+df_in = pd.DataFrame(columns=["MD","Azimuth","Angle"])
+flip_sign = False
+if method == "Excel upload":
+    file = st.file_uploader("Upload Excel workbook", type=["xlsx", "xls"])
     if file is not None:
-        df_in = parse_csv_flexible(file)
-        if flip_sign:
-            df_in["Angle"] = -df_in["Angle"]
-        # auto flip if most angles are positive and user did not flip
-        if not flip_sign and len(df_in) > 0 and df_in["Angle"].median() > 0:
-            df_in["Angle"] = -df_in["Angle"]
-            st.info("Detected positive-down dips in CSV. Converted to negative-down.")
-        st.caption(f"Loaded {len(df_in)} survey rows")
-        st.dataframe(df_in.head(10), use_container_width=True)
-    else:
-        df_in = pd.DataFrame(columns=["MD","Azimuth","Angle"])
+        try:
+            xls = pd.ExcelFile(file)
+            sheet = st.selectbox("Pick worksheet", xls.sheet_names, index=0)
+            df_raw = pd.read_excel(xls, sheet_name=sheet)
+            flip_sign = st.checkbox("Angle in file is positive-down - flip to negative-down", value=False)
+            df_in = parse_df_flexible(df_raw)
+        except Exception as e:
+            st.error(f"Failed to read Excel: {e}")
+elif method == "CSV upload":
+    file = st.file_uploader("Upload CSV (MD, Azimuth, Angle). Example headers accepted: MD, Azimuth, Angle or Measured Depth, Azi, Dip", type=["csv"])
+    if file is not None:
+        try:
+            df_raw = pd.read_csv(file)
+            flip_sign = st.checkbox("CSV angle is positive-down - flip sign to negative-down", value=False)
+            df_in = parse_df_flexible(df_raw)
+        except Exception as e:
+            st.error(f"Failed to read CSV: {e}")
 else:
     df_in = st.data_editor(
         pd.DataFrame(
@@ -223,14 +242,53 @@ else:
         use_container_width=True,
     )
 
+# auto or manual sign flip
+if not df_in.empty:
+    if flip_sign:
+        df_in["Angle"] = -df_in["Angle"]
+    elif df_in["Angle"].median() > 0:
+        df_in["Angle"] = -df_in["Angle"]
+        st.info("Detected positive-down dips. Converted to negative-down.")
+
+# manual collar always available
+st.markdown("#### Actual collar")
+default_collar_az = float(df_in.iloc[0]["Azimuth"]) if not df_in.empty else plan_az0
+default_collar_dip = float(df_in.iloc[0]["Angle"]) if not df_in.empty else plan_dip0
+collar_az = st.number_input("Actual collar azimuth deg", value=float(default_collar_az), step=1.0)
+collar_dip = st.number_input("Actual collar dip-from-horizontal deg (negative down)", value=float(default_collar_dip), step=1.0)
+force_manual_collar = st.checkbox("Force manual collar at MD 0", value=True)
+
+# show table with az and dip change per 100 m
+if not df_in.empty:
+    df_show = add_delta_columns(df_in)
+    st.caption(f"Loaded {len(df_in)} survey rows")
+    st.dataframe(df_show, use_container_width=True)
+else:
+    st.caption("No surveys loaded")
+
+# prepare stations list
 actual_stations_base = [
     {"MD": float(r["MD"]), "Azimuth": float(r["Azimuth"]), "Angle": float(r["Angle"])}
     for _, r in pd.DataFrame(df_in).dropna(subset=["MD","Azimuth","Angle"]).iterrows()
 ]
+actual_stations_base = sorted(actual_stations_base, key=lambda d: float(d["MD"]))
 
-# enforce MD=0
-seed_mode = st.selectbox("If CSV starts after 0 m, seed MD=0 using", options=["first_survey", "planned"], index=0)
-actual_stations_base = ensure_zero_station(actual_stations_base, seed_from=seed_mode, plan_az0=plan_az0, plan_dip0=plan_dip0)
+# enforce or override MD 0
+if force_manual_collar:
+    if actual_stations_base and actual_stations_base[0]["MD"] <= 1e-9:
+        # replace first row values
+        actual_stations_base[0]["Azimuth"] = float(collar_az)
+        actual_stations_base[0]["Angle"] = float(collar_dip)
+    else:
+        # insert MD 0
+        actual_stations_base.insert(0, {"MD": 0.0, "Azimuth": float(collar_az), "Angle": float(collar_dip)})
+else:
+    # if not forcing, still ensure a 0 station exists, using file start or planned as fallback
+    if actual_stations_base:
+        if actual_stations_base[0]["MD"] > 1e-9:
+            # seed from first survey in file
+            az0, dip0 = float(actual_stations_base[0]["Azimuth"]), float(actual_stations_base[0]["Angle"])
+            actual_stations_base.insert(0, {"MD": 0.0, "Azimuth": az0, "Angle": dip0})
 
 # suggested lift/drift from last 3
 sug_lift, sug_drift = derive_lift_drift_last3(actual_stations_base) if len(actual_stations_base) >= 3 else (None, None)
@@ -244,9 +302,9 @@ with colS2:
 
 colR1, colR2 = st.columns(2)
 with colR1:
-    rem_lift = st.number_input("Remaining avg lift deg/100m", value=(sug_lift if sug_lift is not None else -2.0), step=0.1)
+    rem_lift = st.number_input("Remaining avg lift deg/100m", value=(sug_lift if sug_lift is not None else 2.0), step=0.1)
 with colR2:
-    rem_drift = st.number_input("Remaining avg drift deg/100m", value=(sug_drift if sug_drift is not None else -1.0), step=0.1)
+    rem_drift = st.number_input("Remaining avg drift deg/100m", value=(sug_drift if sug_drift is not None else 1.0), step=0.1)
 
 # extension toggle
 extend_to_plan = st.checkbox("Extend actual to planned length", value=True)
@@ -357,4 +415,4 @@ fig3d.update_layout(
 )
 st.plotly_chart(fig3d, use_container_width=True)
 
-st.caption("Angles are dip-from-horizontal. Negative values point down. Target plane is positioned by downhole MD on the planned hole. If CSV does not start at 0 m, a 0 m station is inserted.")
+st.caption("Angles are dip-from-horizontal. Negative values point down. Target plane is positioned by downhole MD on the planned hole. If your file does not start at 0 m, a 0 m station is inserted or overridden by the manual collar, depending on the toggle.")
